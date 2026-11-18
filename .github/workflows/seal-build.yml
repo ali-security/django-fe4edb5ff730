@@ -1,0 +1,339 @@
+name: seal-build
+
+# Django 3.2.x has no GitHub Actions CI upstream (it ran on Jenkins). This
+# workflow mirrors the project's own build (setup.cfg/setup.py via setuptools)
+# and test command (tox.ini / docs: `cd tests && python runtests.py`).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Test labels passed to runtests.py (empty = full suite)"
+        required: false
+        default: ""
+
+env:
+  PIP_INDEX_URL: https://:2022-10-04@time-machines-pypi.sealsecurity.io/
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10.7"
+      - name: Install release toolchain
+        run: python -m pip install setuptools==59.6.0 wheel==0.37.0 build==0.8.0
+      - name: Build sdist and wheel
+        run: python -m build --no-isolation
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.8"
+            database: sqlite
+          - python-version: "3.10.7"
+            database: sqlite
+          - python-version: "3.10.7"
+            database: postgresql
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      # One memcached per binding: parallel workers run the three memcached
+      # test classes concurrently and each one flushes its server on clear().
+      memcached-python:
+        image: memcached:1.6
+        ports:
+          - 11211:11211
+      memcached-pylibmc:
+        image: memcached:1.6
+        ports:
+          - 11212:11211
+      memcached-pymemcache:
+        image: memcached:1.6
+        ports:
+          - 11213:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmemcached-dev gettext watchman libpq-dev postgresql-client
+      # Django 3.2.16's inspectdb test_custom_fields assumes SQLite < 3.37
+      # (fixed upstream only in 3.2.17); ubuntu-22.04 ships 3.37.2, so run the
+      # suite against SQLite 3.36.0 built from the sqlite.org amalgamation.
+      - name: Build SQLite 3.36.0
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -sSLO https://www.sqlite.org/2021/sqlite-autoconf-3360000.tar.gz
+          tar xzf sqlite-autoconf-3360000.tar.gz
+          cd sqlite-autoconf-3360000
+          CFLAGS="-O2 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_FTS3 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_DBSTAT_VTAB -DSQLITE_MAX_VARIABLE_NUMBER=250000" \
+            ./configure --prefix="$RUNNER_TEMP/sqlite"
+          make -j4
+          make install
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlite/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Show SQLite version
+        run: python -c "import sqlite3; print('SQLite', sqlite3.sqlite_version)"
+      - name: Install Django and test requirements
+        run: |
+          python -m pip install -e .
+          python -m pip install -r tests/requirements/py3.txt
+          python -m pip install -r tests/requirements/postgres.txt
+      # pywatchman 1.4.1 (newest at release time) has a C bser extension that
+      # raises "PY_SSIZE_T_CLEAN macro must be defined" on Python >= 3.10.
+      - name: Install a Python 3.10-compatible pywatchman
+        if: matrix.python-version != '3.8'
+        run: python -m pip install --index-url https://pypi.org/simple pywatchman==2.0.0
+      - name: Write test settings
+        working-directory: tests
+        run: |
+          if [ "${{ matrix.database }}" = "sqlite" ]; then
+          cat > test_seal_settings.py <<'EOF'
+          DATABASES = {
+              'default': {'ENGINE': 'django.db.backends.sqlite3'},
+              'other': {'ENGINE': 'django.db.backends.sqlite3'},
+          }
+          EOF
+          else
+          cat > test_seal_settings.py <<'EOF'
+          _db = {
+              'ENGINE': 'django.db.backends.postgresql',
+              'USER': 'postgres',
+              'PASSWORD': 'postgres',
+              'HOST': 'localhost',
+              'PORT': 5432,
+          }
+          DATABASES = {
+              'default': dict(_db, NAME='django'),
+              'other': dict(_db, NAME='django_other'),
+          }
+          EOF
+          fi
+          cat >> test_seal_settings.py <<'EOF'
+          CACHES = {
+              'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'},
+              'memcached': {
+                  'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+                  'LOCATION': '127.0.0.1:11211',
+              },
+              'pylibmc': {
+                  'BACKEND': 'django.core.cache.backends.memcached.PyLibMCCache',
+                  'LOCATION': '127.0.0.1:11212',
+              },
+              'pymemcache': {
+                  'BACKEND': 'django.core.cache.backends.memcached.PyMemcacheCache',
+                  'LOCATION': '127.0.0.1:11213',
+              },
+          }
+          SECRET_KEY = 'django_tests_secret_key'
+          PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+          DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
+          EOF
+      # Start the watchman service and confirm Django's own availability check
+      # sees it, so the autoreload WatchmanReloaderTests run instead of skipping.
+      - name: Start watchman
+        run: |
+          watchman version
+          watchman watch-project "$GITHUB_WORKSPACE"
+          python -c "from django.utils.autoreload import WatchmanReloader as W; W.check_availability(); print('watchman available to Django')"
+      - name: Run test suite (${{ matrix.database }})
+        working-directory: tests
+        shell: bash
+        run: python runtests.py --settings=test_seal_settings -v 2 --parallel 4 ${{ inputs.test-filter }} 2>&1 | tee "$RUNNER_TEMP/runtests.log"
+      - name: Test result summary
+        run: |
+          python - "$RUNNER_TEMP/runtests.log" <<'EOF'
+          import collections, re, sys
+          lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+          ran = [l for l in lines if re.match(r'^Ran \d+ tests', l)]
+          ok = sum(1 for l in lines if l.endswith(' ... ok'))
+          xfail = sum(1 for l in lines if l.endswith(' ... expected failure'))
+          skips = [l for l in lines if ' ... skipped ' in l]
+          for l in ran:
+              print(l)
+          print(f'Total ran: {sum(int(l.split()[1]) for l in ran)}' if ran else 'Ran: no total line found')
+          print(f'Passed: {ok}  Skipped: {len(skips)}  Expected failures: {xfail}')
+          categories = [
+              ('other-database-backend',
+               'targets a database vendor/feature this leg does not have; SQLite, PostgreSQL, '
+               'SpatiaLite and PostGIS each run in their own leg, Oracle and MySQL are not provisioned',
+               re.compile(r"Oracle|MySQL|MariaDB|PostgreSQL|SQLite|sqlite|[Pp]sycopg2|cx_Oracle|"
+                          r"Database has feature|Database doesn't support feature|backend does not support|"
+                          r"databases that don't validate|SpatiaLite|PostGIS|"
+                          r"Database doesn't support all the lookups|geography support")),
+              ('version-gated',
+               'asserts the behaviour of an older library release than the one installed '
+               '(the newer-version counterpart of the test runs instead)',
+               re.compile(r'GDAL < ')),
+              ('selenium-opt-in',
+               'live-browser tests run only with runtests.py --selenium=<browser>, not in the default suite',
+               re.compile(r'No browsers specified')),
+              ('cache-backend-feature',
+               'behaviour the cache backend under test does not implement by design',
+               re.compile(r"Culling isn't implemented|dummy backend")),
+          ]
+          grouped = collections.defaultdict(collections.Counter)
+          for l in skips:
+              reason = re.sub(r'^.* \.\.\. skipped ', '', l)
+              cat = next((c for c, _, rx in categories if rx.search(reason)), 'other')
+              grouped[cat][reason] += 1
+          print('Skipped tests by category and reason:')
+          for cat, why, _ in categories + [('other', 'see reason', None)]:
+              if grouped[cat]:
+                  print(f'[{cat}] {sum(grouped[cat].values())} skipped: {why}')
+                  for reason, n in grouped[cat].most_common():
+                      print(f'  {n:5d}  {reason}')
+          EOF
+
+  test-gis:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    container: ubuntu:20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [spatialite, postgis]
+    services:
+      postgres:
+        image: postgis/postgis:13-3.1
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: UTC
+    steps:
+      - name: Install system dependencies (GEOS 3.8, GDAL 3.0, SpatiaLite 4.3)
+        run: |
+          apt-get update
+          apt-get install -y git python3 python3-venv python3-dev gcc zlib1g-dev \
+            libmemcached-dev gettext binutils libproj-dev gdal-bin libgdal-dev \
+            libgeos-dev libsqlite3-mod-spatialite libpq-dev curl ca-certificates
+          python3 -m venv /opt/venv
+          echo /opt/venv/bin >> "$GITHUB_PATH"
+      # gis_tests.test_geoip2 needs the GeoLite2 City + Country databases
+      # (MaxMind requires an account key, so use the public P3TERX mirror).
+      - name: Download GeoLite2 databases
+        run: |
+          mkdir -p /opt/geoip
+          for db in City Country; do
+            curl -sSLf -o "/opt/geoip/GeoLite2-$db.mmdb" \
+              "https://github.com/P3TERX/GeoLite.mmdb/releases/download/2026.10.28/GeoLite2-$db.mmdb" \
+            || curl -sSLf -o "/opt/geoip/GeoLite2-$db.mmdb" \
+              "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-$db.mmdb"
+          done
+          ls -l /opt/geoip
+      - uses: actions/checkout@v4
+      - name: Install Django and test requirements
+        run: |
+          python -m pip install --upgrade "pip<23"
+          python -m pip install -e .
+          python -m pip install -r tests/requirements/py3.txt
+          python -m pip install -r tests/requirements/postgres.txt
+      - name: Write test settings
+        working-directory: tests
+        run: |
+          if [ "${{ matrix.backend }}" = "spatialite" ]; then
+          cat > test_gis_settings.py <<'EOF'
+          DATABASES = {
+              'default': {'ENGINE': 'django.contrib.gis.db.backends.spatialite'},
+              'other': {'ENGINE': 'django.contrib.gis.db.backends.spatialite'},
+          }
+          SECRET_KEY = 'django_tests_secret_key'
+          PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+          DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
+          EOF
+          else
+          cat > test_gis_settings.py <<'EOF'
+          _db = {
+              'ENGINE': 'django.contrib.gis.db.backends.postgis',
+              'USER': 'postgres',
+              'PASSWORD': 'postgres',
+              'HOST': 'postgres',
+              'PORT': 5432,
+          }
+          DATABASES = {
+              'default': dict(_db, NAME='django'),
+              'other': dict(_db, NAME='django_other'),
+          }
+          SECRET_KEY = 'django_tests_secret_key'
+          PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+          DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
+          EOF
+          fi
+          echo "GEOIP_PATH = '/opt/geoip'" >> test_gis_settings.py
+      - name: Run GIS test suite (${{ matrix.backend }})
+        working-directory: tests
+        shell: bash
+        run: python runtests.py --settings=test_gis_settings -v 2 --parallel 4 ${{ inputs.test-filter || 'gis_tests' }} 2>&1 | tee /tmp/runtests.log
+      - name: Test result summary
+        run: |
+          python - /tmp/runtests.log <<'EOF'
+          import collections, re, sys
+          lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+          ran = [l for l in lines if re.match(r'^Ran \d+ tests', l)]
+          ok = sum(1 for l in lines if l.endswith(' ... ok'))
+          xfail = sum(1 for l in lines if l.endswith(' ... expected failure'))
+          skips = [l for l in lines if ' ... skipped ' in l]
+          for l in ran:
+              print(l)
+          print(f'Total ran: {sum(int(l.split()[1]) for l in ran)}' if ran else 'Ran: no total line found')
+          print(f'Passed: {ok}  Skipped: {len(skips)}  Expected failures: {xfail}')
+          categories = [
+              ('other-database-backend',
+               'targets a database vendor/feature this leg does not have; SQLite, PostgreSQL, '
+               'SpatiaLite and PostGIS each run in their own leg, Oracle and MySQL are not provisioned',
+               re.compile(r"Oracle|MySQL|MariaDB|PostgreSQL|SQLite|sqlite|[Pp]sycopg2|cx_Oracle|"
+                          r"Database has feature|Database doesn't support feature|backend does not support|"
+                          r"databases that don't validate|SpatiaLite|PostGIS|"
+                          r"Database doesn't support all the lookups|geography support")),
+              ('version-gated',
+               'asserts the behaviour of an older library release than the one installed '
+               '(the newer-version counterpart of the test runs instead)',
+               re.compile(r'GDAL < ')),
+              ('selenium-opt-in',
+               'live-browser tests run only with runtests.py --selenium=<browser>, not in the default suite',
+               re.compile(r'No browsers specified')),
+              ('cache-backend-feature',
+               'behaviour the cache backend under test does not implement by design',
+               re.compile(r"Culling isn't implemented|dummy backend")),
+          ]
+          grouped = collections.defaultdict(collections.Counter)
+          for l in skips:
+              reason = re.sub(r'^.* \.\.\. skipped ', '', l)
+              cat = next((c for c, _, rx in categories if rx.search(reason)), 'other')
+              grouped[cat][reason] += 1
+          print('Skipped tests by category and reason:')
+          for cat, why, _ in categories + [('other', 'see reason', None)]:
+              if grouped[cat]:
+                  print(f'[{cat}] {sum(grouped[cat].values())} skipped: {why}')
+                  for reason, n in grouped[cat].most_common():
+                      print(f'  {n:5d}  {reason}')
+          EOF
