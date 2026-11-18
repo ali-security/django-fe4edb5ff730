@@ -2,6 +2,7 @@ from django.contrib.gis.db.backends.base.features import BaseSpatialFeatures
 from django.db.backends.oracle.features import (
     DatabaseFeatures as OracleDatabaseFeatures,
 )
+from django.utils.functional import cached_property
 
 
 class DatabaseFeatures(BaseSpatialFeatures, OracleDatabaseFeatures):
@@ -12,3 +13,14 @@ class DatabaseFeatures(BaseSpatialFeatures, OracleDatabaseFeatures):
     supports_dwithin_distance_expr = False
     supports_tolerance_parameter = True
     unsupported_geojson_options = {'bbox', 'crs', 'precision'}
+
+    @cached_property
+    def django_test_skips(self):
+        skips = super().django_test_skips.copy()
+        skips.update({
+            "Oracle doesn't support nested geometry collections.": {
+                'gis_tests.geoapp.tests.SaveLoadTests.'
+                'test_geometrycollectionfield_default_max_ignored_on_read',
+            },
+        })
+        return skips

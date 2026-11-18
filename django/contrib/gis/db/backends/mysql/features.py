@@ -40,4 +40,11 @@ class DatabaseFeatures(BaseSpatialFeatures, MySQLDatabaseFeatures):
                     'gis_tests.geoapp.tests.GeoLookupTest.test_disjoint_lookup',
                 },
             })
+        if self.connection.mysql_is_mariadb:
+            skips.update({
+                "MariaDB doesn't support nested geometry collections.": {
+                    'gis_tests.geoapp.tests.SaveLoadTests.'
+                    'test_geometrycollectionfield_default_max_ignored_on_read',
+                },
+            })
         return skips
