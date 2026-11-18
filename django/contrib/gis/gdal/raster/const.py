@@ -68,6 +68,9 @@ GDAL_COLOR_TYPES = {
 # Fixed base path for buffer-based GDAL in-memory files.
 VSI_FILESYSTEM_BASE_PATH = '/vsimem/'
 
+# Prefix for GDAL virtual filesystems.
+VSI_FILESYSTEM_PREFIX = '/vsi'
+
 # Should the memory file system take ownership of the buffer, freeing it when
 # the file is deleted? (No, GDALRaster.__del__() will delete the buffer.)
 VSI_TAKE_BUFFER_OWNERSHIP = False

@@ -1,13 +1,30 @@
+import json
+import os
+import tempfile
+
+from django.contrib.auth.models import Permission, User
+from django.contrib.contenttypes.models import ContentType
 from django.contrib.gis import admin
 from django.contrib.gis.geos import Point
-from django.test import SimpleTestCase, override_settings
+from django.core.exceptions import SuspiciousOperation
+from django.test import RequestFactory, TestCase, override_settings
 
 from .admin import UnmodifiableAdmin
 from .models import City, site
 
 
 @override_settings(ROOT_URLCONF='django.contrib.gis.tests.geoadmin.urls')
-class GeoAdminTest(SimpleTestCase):
+class GeoAdminTest(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user('test', password='password', is_staff=True)
+        cls.user.user_permissions.add(
+            Permission.objects.get(
+                codename='view_city',
+                content_type=ContentType.objects.get_for_model(City),
+            )
+        )
 
     def test_ensure_geographic_media(self):
         geoadmin = site._registry[City]
@@ -97,3 +114,33 @@ class GeoAdminTest(SimpleTestCase):
             "Error creating geometry from value 'INVALID()' (String input "
             "unrecognized as WKT EWKT, and HEXEWKB.)"
         )
+
+    def test_raster_lookup_not_allowed(self):
+        geoadmin = site._registry[City]
+        request = RequestFactory().get('/city/', data={'point': '/vsicurl/someurl'})
+        request.user = self.user
+        msg = "Cannot use object '/vsicurl/someurl' for a spatial lookup parameter."
+        with self.assertRaisesMessage(SuspiciousOperation, msg):
+            geoadmin.get_changelist_instance(request)
+
+    def test_raster_file_write_lookup_not_allowed(self):
+        geoadmin = site._registry[City]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raster_path = os.path.join(tmpdir, 'written.tif')
+            raster_json = json.dumps({
+                'name': raster_path,
+                'driver': 'tif',
+                'width': 1,
+                'height': 1,
+                'srid': 4326,
+                'bands': [{'data': [0]}],
+            })
+            request = RequestFactory().get('/city/', data={'point': raster_json})
+            request.user = self.user
+            msg = 'If this is a raster, wrap it with GDALRaster()'
+            with self.assertRaisesMessage(SuspiciousOperation, msg):
+                try:
+                    geoadmin.get_changelist_instance(request)
+                finally:
+                    # Nothing is written, however the lookup fails.
+                    self.assertEqual(os.listdir(tmpdir), [])
